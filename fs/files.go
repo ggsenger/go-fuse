@@ -20,13 +20,14 @@ import (
 // operations are implemented. When using the Fd from a *os.File, call
 // syscall.Dup() on the fd, to avoid os.File's finalizer from closing
 // the file descriptor.
-func NewLoopbackFile(fd int) FileHandle {
-	return &loopbackFile{fd: fd}
+func NewLoopbackFile(fd int, size int64) FileHandle {
+	return &loopbackFile{fd: fd, size: size}
 }
 
 type loopbackFile struct {
-	mu sync.Mutex
-	fd int
+	mu   sync.Mutex
+	fd   int
+	size int64
 }
 
 var _ = (FileHandle)((*loopbackFile)(nil))
@@ -218,6 +219,11 @@ func (f *loopbackFile) Getattr(ctx context.Context, a *fuse.AttrOut) syscall.Err
 	err := syscall.Fstat(f.fd, &st)
 	if err != nil {
 		return ToErrno(err)
+	}
+	if f.size > 0 {
+		st.Size = f.size
+		st.Mode = st.Mode & 00444
+		st.Blocks = (st.Size + st.Blksize - 1) / st.Blksize
 	}
 	a.FromStat(&st)
 

@@ -5,9 +5,15 @@
 package fs
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -50,7 +56,7 @@ func (r *LoopbackRoot) idFromStat(st *syscall.Stat_t) StableAttr {
 	swapped := (uint64(st.Dev) << 32) | (uint64(st.Dev) >> 32)
 	swappedRootDev := (r.Dev << 32) | (r.Dev >> 32)
 	return StableAttr{
-		Mode: uint32(st.Mode),
+		Mode: uint32(st.Mode) & 00444,
 		Gen:  1,
 		// This should work well for traditional backing FSes,
 		// not so much for other go-fuse FS-es
@@ -90,6 +96,33 @@ var _ = (NodeUnlinker)((*LoopbackNode)(nil))
 var _ = (NodeRmdirer)((*LoopbackNode)(nil))
 var _ = (NodeRenamer)((*LoopbackNode)(nil))
 
+var sizeRE = regexp.MustCompile(`SIZE="(\d+)"`)
+
+func getDevSize(devName string) int64 {
+
+	output, err := exec.Command(
+		"lsblk",
+		"-b", // size in bytes
+		"-P", // field as key=value pair
+		"-o", "SIZE",
+		devName,
+	).Output()
+	if err != nil {
+		return -1
+	}
+	s := bufio.NewScanner(bytes.NewReader(output))
+	for s.Scan() {
+		size := sizeRE.FindAllStringSubmatch(s.Text(), -1)
+		devSize, err := strconv.ParseInt(size[0][1], 10, 64)
+		if err != nil {
+			fmt.Printf("unable to parse device size %s for %s\n", size[0], devName)
+			os.Exit(1)
+		}
+		return devSize
+	}
+	return 0
+}
+
 func (n *LoopbackNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	s := syscall.Statfs_t{}
 	err := syscall.Statfs(n.path(), &s)
@@ -111,11 +144,17 @@ func (n *LoopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryO
 	p := filepath.Join(n.path(), name)
 
 	st := syscall.Stat_t{}
-	err := syscall.Lstat(p, &st)
+	err := syscall.Stat(p, &st)
 	if err != nil {
 		return nil, ToErrno(err)
 	}
 
+	size := getDevSize(p)
+	if size >= 0 {
+		st.Size = size
+		st.Mode = st.Mode & 00444
+		st.Blocks = (st.Size + 512 - 1) / 512
+	}
 	out.Attr.FromStat(&st)
 	node := n.RootData.newNode(n.EmbeddedInode(), name, &st)
 	ch := n.NewInode(ctx, node, n.RootData.idFromStat(&st))
@@ -219,7 +258,7 @@ func (n *LoopbackNode) Create(ctx context.Context, name string, flags uint32, mo
 
 	node := n.RootData.newNode(n.EmbeddedInode(), name, &st)
 	ch := n.NewInode(ctx, node, n.RootData.idFromStat(&st))
-	lf := NewLoopbackFile(fd)
+	lf := NewLoopbackFile(fd, 0)
 
 	out.FromStat(&st)
 	return ch, lf, 0, 0
@@ -281,12 +320,14 @@ func (n *LoopbackNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 
 func (n *LoopbackNode) Open(ctx context.Context, flags uint32) (fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	flags = flags &^ syscall.O_APPEND
+	flags = flags &^ syscall.O_NOFOLLOW
 	p := n.path()
 	f, err := syscall.Open(p, int(flags), 0)
 	if err != nil {
 		return nil, 0, ToErrno(err)
 	}
-	lf := NewLoopbackFile(f)
+	size := getDevSize(p)
+	lf := NewLoopbackFile(f, size)
 	return lf, 0, 0
 }
 
@@ -312,15 +353,15 @@ func (n *LoopbackNode) Getattr(ctx context.Context, f FileHandle, out *fuse.Attr
 
 	var err error
 	st := syscall.Stat_t{}
-	if &n.Inode == n.Root() {
-		err = syscall.Stat(p, &st)
-	} else {
-		err = syscall.Lstat(p, &st)
-	}
+	err = syscall.Stat(p, &st)
 
 	if err != nil {
 		return ToErrno(err)
 	}
+	st.Size = 32212254720
+	st.Blksize = 4096
+	st.Mode = st.Mode & 00444
+	st.Blocks = (st.Size + 512 - 1) / 512
 	out.FromStat(&st)
 	return OK
 }
